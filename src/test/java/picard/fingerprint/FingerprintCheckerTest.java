@@ -332,9 +332,7 @@ public class FingerprintCheckerTest {
         fingerprintIdDetailsFingerprintMap.values().forEach(combinedFp2::merge);
 
         Assert.assertNotEquals(combinedFp.keySet().size(), 0);
-        for (final HaplotypeBlock block : combinedFp.keySet()) {
-            Assert.assertTrue(FingerprintingTestUtils.areHaplotypeProbabilitiesEqual(combinedFp.get(block), combinedFp2.get(block)));
-        }
+        FingerprintingTestUtils.assertFingerPrintHPsAreEqual(combinedFp, combinedFp2);
 
         final Function<FingerprintIdDetails, String> bySample = Fingerprint.getFingerprintIdDetailsStringFunction(CrosscheckMetric.DataType.SAMPLE);
         final Map<FingerprintIdDetails, Fingerprint> fingerprintIdDetailsFingerprintMap1 =
@@ -344,14 +342,13 @@ public class FingerprintCheckerTest {
                 Fingerprint.mergeFingerprintsBy(fingerprintIdDetailsFingerprintMap, bySample);
 
         Assert.assertNotEquals(fingerprintIdDetailsFingerprintMap1.keySet().size(), 0);
+
         for (final FingerprintIdDetails fpd1 : fingerprintIdDetailsFingerprintMap1.keySet()) {
             final Fingerprint fingerprint1 = fingerprintIdDetailsFingerprintMap1.get(fpd1);
             final Fingerprint fingerprint2 = fingerprintIdDetailsFingerprintMap2.get(fpd1);
 
             Assert.assertNotEquals(fingerprint1.keySet().size(), 0);
-            for (final HaplotypeBlock block : fingerprint1.keySet()) {
-                Assert.assertTrue(FingerprintingTestUtils.areHaplotypeProbabilitiesEqual(fingerprint1.get(block), fingerprint2.get(block)));
-            }
+            FingerprintingTestUtils.assertFingerPrintHPsAreEqual(fingerprint1, fingerprint2);
         }
     }
 
@@ -374,9 +371,7 @@ public class FingerprintCheckerTest {
         fingerprintIdDetailsFingerprintMap.values().forEach(combinedFp2::merge);
 
         Assert.assertNotEquals(combinedFp.keySet().size(), 0);
-        for (final HaplotypeBlock block : combinedFp.keySet()) {
-            Assert.assertTrue(FingerprintingTestUtils.areHaplotypeProbabilitiesEqual(combinedFp.get(block), combinedFp2.get(block)));
-        }
+        FingerprintingTestUtils.assertFingerPrintHPsAreEqual(combinedFp, combinedFp2);
 
         final Function<FingerprintIdDetails, String> bySample = Fingerprint.getFingerprintIdDetailsStringFunction(CrosscheckMetric.DataType.SAMPLE);
 
@@ -386,14 +381,14 @@ public class FingerprintCheckerTest {
                 Fingerprint.mergeFingerprintsBy(fingerprintIdDetailsFingerprintMap, bySample);
 
         Assert.assertNotEquals(fingerprintIdDetailsFingerprintMap1.keySet().size(), 0);
+        Assert.assertEquals(fingerprintIdDetailsFingerprintMap1.keySet().size(), fingerprintIdDetailsFingerprintMap2.size());
+
         for (final FingerprintIdDetails fpd1 : fingerprintIdDetailsFingerprintMap1.keySet()) {
             final Fingerprint fingerprint1 = fingerprintIdDetailsFingerprintMap1.get(fpd1);
             final Fingerprint fingerprint2 = fingerprintIdDetailsFingerprintMap2.get(fpd1);
 
             Assert.assertNotEquals(fingerprint1.keySet().size(), 0);
-            for (final HaplotypeBlock block : fingerprint1.keySet()) {
-                Assert.assertTrue(FingerprintingTestUtils.areHaplotypeProbabilitiesEqual(fingerprint1.get(block), fingerprint2.get(block)));
-            }
+            FingerprintingTestUtils.assertFingerPrintHPsAreEqual(fingerprint1, fingerprint2);
         }
     }
 
