@@ -31,11 +31,7 @@ import htsjdk.samtools.SamReader;
 import htsjdk.samtools.SamReaderFactory;
 import htsjdk.samtools.reference.ReferenceSequence;
 import htsjdk.samtools.reference.ReferenceSequenceFileWalker;
-import htsjdk.samtools.util.CloserUtil;
-import htsjdk.samtools.util.IOUtil;
-import htsjdk.samtools.util.Log;
-import htsjdk.samtools.util.ProgressLogger;
-import htsjdk.samtools.util.SequenceUtil;
+import htsjdk.samtools.util.*;
 import org.broadinstitute.barclay.argparser.Argument;
 import org.broadinstitute.barclay.argparser.ArgumentCollection;
 import picard.PicardException;
@@ -45,8 +41,13 @@ import picard.cmdline.argumentcollections.OutputArgumentCollection;
 import picard.cmdline.argumentcollections.RequiredOutputArgumentCollection;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingDeque;
 
 /**
  * Super class that is designed to provide some consistent structure between subclasses that
@@ -77,6 +78,28 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
     private static final Log log = Log.getInstance(SinglePassSamProgram.class);
 
+    @Argument(doc = "Allocate each metrics program it's own thread. I/O and record parsing is still shared.")
+    public boolean PROCESS_IN_PARALLEL = true;
+
+    /**
+     * Number of SAMRecords to batch together before allocating to worker threads.
+     * A larger batch size reduces thread synchronisation overhead.
+     */
+    private static final int BATCH_SIZE = 512;
+
+    /**
+     * Maximum number of outstanding batches.
+     * The default of two batches results in double buffering: one batch for I/O and parsing, and another
+     * being processed in parallel by the program worker threads.
+     */
+    private static final int IN_FLIGHT_BATCHES = 2;
+
+    /**
+     * End of stream sentinel value.
+     * Program worker threads use this object to indicate a unexceptional end of stream.
+     */
+    private static final Exception EOS_SENTINEL = new Exception();
+
     /**
      * Set the reference File.
      */
@@ -90,16 +113,23 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
      */
     @Override
     protected final int doWork() {
-
-        makeItSo(INPUT, REFERENCE_SEQUENCE, ASSUME_SORTED, STOP_AFTER, Arrays.asList(this));
+        makeItSo(INPUT, REFERENCE_SEQUENCE, ASSUME_SORTED, STOP_AFTER, Arrays.asList(this), PROCESS_IN_PARALLEL, PROCESS_IN_PARALLEL);
         return 0;
     }
-
     public static void makeItSo(final File input,
                                 final File referenceSequence,
                                 final boolean assumeSorted,
                                 final long stopAfter,
                                 final Collection<SinglePassSamProgram> programs) {
+        makeItSo(input, referenceSequence, assumeSorted, stopAfter, programs, true, true);
+    }
+    public static void makeItSo(final File input,
+                                final File referenceSequence,
+                                final boolean assumeSorted,
+                                final long stopAfter,
+                                final Collection<SinglePassSamProgram> programs,
+                                boolean parallel,
+                                boolean useAsyncIterator) {
 
         // Setup the standard inputs
         IOUtil.assertFileIsReadable(input);
@@ -133,6 +163,8 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
             }
         }
 
+        final BlockingQueue<Exception> completion = new LinkedBlockingDeque<>();
+        final List<ArrayBlockingQueue<List<Tuple<ReferenceSequence, SAMRecord>>>> buffers = new ArrayList<>(programs.size());
         // Call the abstract setup method!
         boolean anyUseNoRefReads = false;
         for (final SinglePassSamProgram program : programs) {
@@ -141,40 +173,122 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
             }
             program.setup(in.getFileHeader(), input);
             anyUseNoRefReads = anyUseNoRefReads || program.usesNoRefReads();
+
+            if (parallel) {
+                ArrayBlockingQueue<List<Tuple<ReferenceSequence, SAMRecord>>> buffer = new ArrayBlockingQueue<>(IN_FLIGHT_BATCHES);
+                buffers.add(buffer);
+                Thread t = new Thread(new SinglePassSamProgramRunner(program, buffer, completion));
+                t.setName(program.toString());
+                t.setDaemon(true);
+                t.start();
+            }
         }
 
+        final ProgressLogger progress = new ProgressLogger(log, 10000000);
+        try (CloseableIterator<SAMRecord> it = useAsyncIterator ? new AsyncBufferedIterator<>(in.iterator(), BATCH_SIZE, IN_FLIGHT_BATCHES, "SinglePassSamProgram") : in.iterator()){
+            List<Tuple<ReferenceSequence, SAMRecord>> batch = new ArrayList<>();
+            while (it.hasNext()) {
+                final SAMRecord rec =  it.next();
+                final ReferenceSequence ref;
+                if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                    ref = null;
+                } else {
+                    ref = walker.get(rec.getReferenceIndex());
+                }
 
-        final ProgressLogger progress = new ProgressLogger(log);
+                if (parallel) {
+                    batch.add(new Tuple<>(ref, rec));
+                    if (batch.size() >= BATCH_SIZE) {
+                        for (ArrayBlockingQueue<List<Tuple<ReferenceSequence, SAMRecord>>> buffer : buffers) {
+                            buffer.put(batch);
+                        }
+                        batch = new ArrayList<>();
+                    }
+                    // Raise any encountered exceptions as early as possible
+                    Exception ex = completion.peek();
+                    if (ex != null && ex != EOS_SENTINEL) {
+                        if (ex instanceof RuntimeException) {
+                            throw (RuntimeException) ex;
+                        } else {
+                            throw new RuntimeException(ex);
+                        }
+                    }
+                } else {
+                    for (final SinglePassSamProgram program : programs) {
+                        program.acceptRead(rec, ref);
+                    }
+                }
 
-        for (final SAMRecord rec : in) {
-            final ReferenceSequence ref;
-            if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                ref = null;
+                progress.record(rec);
+
+                // See if we need to terminate early?
+                if (stopAfter > 0 && progress.getCount() >= stopAfter) {
+                    break;
+                }
+
+                // And see if we're into the unmapped reads at the end
+                if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
+                    break;
+                }
+            }
+            if (parallel) {
+                batch.add(new Tuple<>(null, null)); // Add EOS indicator
+                for (ArrayBlockingQueue<List<Tuple<ReferenceSequence, SAMRecord>>> buffer : buffers) {
+                    buffer.put(batch);
+                }
+                for (int i = 0; i < programs.size(); i++) {
+                    Exception ex = completion.take();
+                    if (ex != EOS_SENTINEL) {
+                        if (ex instanceof RuntimeException) {
+                            throw (RuntimeException) ex;
+                        } else {
+                            throw new RuntimeException(ex);
+                        }
+                    }
+                }
             } else {
-                ref = walker.get(rec.getReferenceIndex());
+                for (final SinglePassSamProgram program : programs) {
+                    program.finish();
+                }
             }
-
-            for (final SinglePassSamProgram program : programs) {
-                program.acceptRead(rec, ref);
-            }
-
-            progress.record(rec);
-
-            // See if we need to terminate early?
-            if (stopAfter > 0 && progress.getCount() >= stopAfter) {
-                break;
-            }
-
-            // And see if we're into the unmapped reads at the end
-            if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
-                break;
-            }
+        } catch (InterruptedException ex) {
+            throw new RuntimeException(ex);
+        } finally {
+            CloserUtil.close(in);
+        }
+    }
+    private static class SinglePassSamProgramRunner implements Runnable {
+        private final ArrayBlockingQueue<List<Tuple<ReferenceSequence, SAMRecord>>> buffer;
+        private final SinglePassSamProgram program;
+        private final BlockingQueue<Exception> completion;
+        public SinglePassSamProgramRunner(SinglePassSamProgram program,
+                                          ArrayBlockingQueue<List<Tuple<ReferenceSequence, SAMRecord>>> buffer,
+                                          BlockingQueue<Exception> completion) {
+            this.program = program;
+            this.buffer = buffer;
+            this.completion = completion;
         }
 
-        CloserUtil.close(in);
-
-        for (final SinglePassSamProgram program : programs) {
-            program.finish();
+        @Override
+        public void run() {
+            Exception exception = EOS_SENTINEL;
+            try {
+                List<Tuple<ReferenceSequence, SAMRecord>> batch = buffer.take();
+                while (true) {
+                    for (Tuple<ReferenceSequence, SAMRecord> r : batch) {
+                        if (r.b == null) {
+                            program.finish();
+                            throw EOS_SENTINEL;
+                        }
+                        program.acceptRead(r.b, r.a);
+                    }
+                    batch = buffer.take();
+                }
+            } catch (Exception e) {
+                exception = e;
+            } finally {
+                completion.add(exception);
+            }
         }
     }
 
